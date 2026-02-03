@@ -9,9 +9,9 @@ def load_index(index_path="data/index.faiss"):
     index = faiss.read_index(index_path)
     with open(index_path + ".ids.json", "r", encoding="utf-8") as f:
         ids = json.load(f)
-    # load the chunks mapping (id -> text)
+    # load the chunks mapping (id -> text) as a single JSON object (dict)
     with open("data/processed/id2text.json", "r", encoding="utf-8") as f:
-        id2text = json.load(f)
+        id2text = json.load(f)  # id2text is a dict: {id: text}
     return index, ids, id2text
 
 def retrieve(query, index, id2text, k=5):
@@ -19,7 +19,8 @@ def retrieve(query, index, id2text, k=5):
     q_emb = embed_model.encode([query], convert_to_numpy=True)
     faiss.normalize_L2(q_emb)
     D, I = index.search(q_emb, k)
-    docs = [ id2text.get(str(i), "") for i in I[0] ]
+    # ids is a list of chunk IDs, id2text is a dict mapping chunk IDs to text
+    docs = [id2text.get(str(i), "") for i in I[0]]
     return docs
 
 def generate_answer(query, docs):
@@ -33,7 +34,7 @@ def generate_answer(query, docs):
 
 if __name__ == "__main__":
     index, ids, id2text = load_index()
-    q = "What is retrieval-augmented generation?"
+    q = "Marcos Luna Ruiz (born 5 April 2003) is a Spanish footballer who plays as a right-back for UD Almería?"
     docs = retrieve(q, index, id2text, k=4)
     ans = generate_answer(q, docs)
     print("Answer:\n", ans)

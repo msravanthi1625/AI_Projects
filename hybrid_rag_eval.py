@@ -30,6 +30,12 @@ import sys
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Any, Optional
 
+import requests
+import wikipedia
+import hashlib
+import json
+import urllib3
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -67,6 +73,17 @@ class QAItem:
     answer_url: str  # ground-truth source URL (URL-level eval)
     category: str = "factual"  # e.g., factual/comparative/multi-hop/inferential
 
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Patch requests to ignore SSL verification
+old_request = requests.Session.request
+
+def new_request(self, method, url, *args, **kwargs):
+    kwargs['verify'] = False
+    return old_request(self, method, url, *args, **kwargs)
+
+requests.Session.request = new_request
 
 # ----------------------------
 # Wikipedia helpers (new)
@@ -100,7 +117,7 @@ def get_random_wikipedia_url(min_words: int = 200) -> Dict[str, str]:
             continue
 
 
-def generate_fixed_set(n: int = 200, min_words: int = 200, out_path: str = "fixed_urls.json") -> List[Dict[str, str]]:
+def generate_fixed_set(n: int = 2, min_words: int = 200, out_path: str = "fixed_urls.json") -> List[Dict[str, str]]:
     """
     Generate a fixed set of n unique Wikipedia pages (title, url, text) and write to out_path.
     This should be run once per group to create the assignment's fixed set.
@@ -123,7 +140,7 @@ def generate_fixed_set(n: int = 200, min_words: int = 200, out_path: str = "fixe
     return urls
 
 
-def generate_random_set(n: int = 300, min_words: int = 200, exclude_titles: Optional[List[str]] = None) -> List[Dict[str, str]]:
+def generate_random_set(n: int = 10, min_words: int = 200, exclude_titles: Optional[List[str]] = None) -> List[Dict[str, str]]:
     """
     Generate n unique random Wikipedia pages, excluding any titles in exclude_titles.
     Returns a list of dicts {url, title, text}. Does NOT write to disk by default.
@@ -182,10 +199,12 @@ def build_corpus_from_wikipedia(fixed_list: List[Dict[str, str]], random_list: L
       fixed_list: list of {"url","title","text"} (200 pages)
       random_list: list of {"url","title","text"} (300 pages)
     Chunk and write to JSONL (one chunk per line).
+    Also writes id2text.json for use in query_rag.py.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     all_pages = fixed_list + random_list
     chunks_out = []
+    id2text = {}
     for page in all_pages:
         url = page["url"]
         title = page.get("title", "")
@@ -196,11 +215,18 @@ def build_corpus_from_wikipedia(fixed_list: List[Dict[str, str]], random_list: L
             continue
         chunks = chunk_text(text, url, title, chunk_size_tokens=300, overlap_tokens=50)
         for c in chunks:
-            chunks_out.append(asdict(c))
+            chunk_dict = asdict(c)
+            chunks_out.append(chunk_dict)
+            id2text[chunk_dict["id"]] = chunk_dict["text"]
     with open(output_path, "w", encoding="utf-8") as f:
         for c in chunks_out:
             f.write(json.dumps(c, ensure_ascii=False) + "\n")
+    # Write id2text mapping for query_rag.py
+    id2text_path = os.path.join(os.path.dirname(output_path), "id2text.json")
+    with open(id2text_path, "w", encoding="utf-8") as f:
+        json.dump(id2text, f, ensure_ascii=False, indent=2)
     print(f"Wrote {len(chunks_out)} chunks to {output_path}")
+    print(f"Wrote id2text mapping to {id2text_path}")
 
 
 # ----------------------------
