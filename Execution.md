@@ -1,13 +1,4 @@
-Here’s a concise guide with the exact commands and examples to run hybrid_rag_eval.py — from setup to quick tests, full pipeline, and the Streamlit UI.
-
-Setup (virtualenv + install)
-Create and activate a virtual environment:
-
-macOS / Linux: python3 -m venv .venv source .venv/bin/activate
-Windows (PowerShell): python -m venv .venv ..venv\Scripts\Activate.ps1
-Install dependencies (requirements.txt should be in your repo). Also install the wikipedia helper: pip install -r requirements.txt pip install wikipedia
-
-Notes:
+**Notes:**
 
 On some platforms (Windows) faiss-cpu may be difficult to pip-install; use conda or platform wheels if needed: conda install -c conda-forge faiss-cpu
 If you get large download times for transformers/torch, consider using smaller models (e.g., t5-small) for quick tests.
@@ -44,16 +35,22 @@ python hybrid_rag_eval.py generate_questions --chunks_in data/processed/chunks.j
 
 python hybrid_rag_eval.py run_eval --chunks_in data/processed/chunks.jsonl --index_dense data/index.faiss --index_bm25 data/bm25_index --questions data/test_questions.jsonl --out_prefix results/report --gen_model google/flan-t5-base --device cpu --top_n 10 --recall_k 10
 
-Options you may change:
+**Run query_rag:**
+
+python query_rag.py
+
+**Options you may change:**
 
 --gen_model: choose a smaller model (e.g., t5-small) for speed during development.
 --device: set to "cuda" if you have a GPU and proper CUDA-enabled PyTorch.
 --top_n / --recall_k / --random_n etc. control retrieval and sampling sizes.
 Running the Streamlit UI
 
-Start the Streamlit app: streamlit run hybrid_rag_eval.py
+***Start the Streamlit app:***
 
-In the UI sidebar set:
+streamlit run hybrid_rag_eval.py
+
+**In the UI sidebar set:**
 
 Chunks JSONL: path to your chunks file (e.g., data/processed/chunks.jsonl)
 Dense index: data/index.faiss
@@ -65,7 +62,8 @@ First-time model loading can take several minutes as HF models are downloaded.
 
 For very large indexes/models, loading in the Streamlit session may use a lot of memory.
 
-Troubleshooting & tips
+**Troubleshooting & tips**
+
 Wikipedia sampling:
 get_random_wikipedia_url uses the wikipedia package and requires internet; expect some retries due to disambiguation pages. Respect Wikimedia rate limits and cache the fixed set once created.
 FAISS install issues:
@@ -81,5 +79,7 @@ One-time fixed set generation: python hybrid_rag_eval.py build_index --generate_
 Generate Qs: python hybrid_rag_eval.py generate_questions --chunks_in data/processed/chunks.jsonl --out_questions data/eval/questions.jsonl --num_questions 100
 Evaluate: python hybrid_rag_eval.py run_eval --chunks_in data/processed/chunks.jsonl --index_dense data/index.faiss --index_bm25 data/bm25_index --questions data/eval/questions.jsonl --out_prefix results/report --gen_model google/flan-t5-base --device cpu --top_n 10 --recall_k 10
 
-Pre-requisites for streamlit:
+**Pre-requisites for streamlit:**
 https://docs.streamlit.io/get-started/installation/community-cloud
+https://share.streamlit.io/
+https://share.streamlit.io/
