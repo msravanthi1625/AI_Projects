@@ -72,6 +72,7 @@ class QAItem:
     answer: str
     answer_url: str  # ground-truth source URL (URL-level eval)
     category: str = "factual"  # e.g., factual/comparative/multi-hop/inferential
+    source_id: str = None      # Optional: chunk/source id for traceability
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -475,22 +476,97 @@ class Evaluator:
 # ----------------------------
 class QuestionGenerator:
     @staticmethod
-    def generate_from_corpus(chunks_jsonl_path: str, out_questions_path: str, num_questions: int = 100):
+    def generate_from_corpus(
+        chunks_jsonl_path: str,
+        out_questions_path: str,
+        num_questions: int = 100,
+        model_name: str = "google/flan-t5-base",
+        device: str = "cpu"
+    ):
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+        import torch
+
         qa_items = []
         with open(chunks_jsonl_path, "r", encoding="utf-8") as f:
             chunks = [json.loads(l) for l in f]
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+
+        # Define question types and their prompts
+        qtypes = [
+            ("factual", "Generate a factual question and its answer from the following context. Output both the question and the answer, each on a new line, prefixed with 'Question:' and 'Answer:'."),
+            ("comparative", "Generate a comparative question and its answer from the following context (compare two entities or facts). Output both the question and the answer, each on a new line, prefixed with 'Question:' and 'Answer:'."),
+            ("inferential", "Generate an inferential question and its answer from the following context (require inference beyond explicit facts). Output both the question and the answer, each on a new line, prefixed with 'Question:' and 'Answer:'."),
+            ("multi-hop", "Generate a multi-hop question and its answer from the following context (require combining information from multiple sentences). Output both the question and the answer, each on a new line, prefixed with 'Question:' and 'Answer:'."),
+        ]
+
         for i in range(num_questions):
             c = random.choice(chunks)
-            sentences = [s.strip() for s in c["text"].split(".") if s.strip()]
-            if len(sentences) < 2:
-                continue
-            question = sentences[0] + "?"
-            answer = sentences[1]
-            qa = QAItem(qid=f"Q{i}", question=question, answer=answer, answer_url=c["url"], category="factual")
+            context = c["text"]
+            chunk_id = c.get("id", None)
+            url = c.get("url", None)
+            qtype, qtype_prompt = qtypes[i % len(qtypes)]
+            prompt = (
+                f"{qtype_prompt}\n"
+                f"Context:\n{context}\n"
+                f"Format:\nQuestion: <question>\nAnswer: <answer>"
+            )
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
+            out = model.generate(**inputs, max_new_tokens=128)
+            output = tokenizer.decode(out[0], skip_special_tokens=True)
+
+            # Debug: Print the raw LLM output for inspection
+            print(f"\n--- LLM Output for chunk {chunk_id} (type: {qtype}) ---\n{output}\n")
+
+            # Parse output (accepts 'Q:', 'Question:', 'A:', 'Answer:')
+            q, a = None, None
+            for line in output.split("\n"):
+                l = line.strip()
+                if l.lower().startswith("q:") or l.lower().startswith("question:"):
+                    q = l.split(":", 1)[1].strip()
+                elif l.lower().startswith("a:") or l.lower().startswith("answer:"):
+                    a = l.split(":", 1)[1].strip()
+            # If only a question is present, try to generate the answer by re-prompting
+            if q and not a:
+                answer_prompt = (
+                    f"Context:\n{context}\n"
+                    f"Provide a short answer to the following question based on the context.\n"
+                    f"Question: {q}\n"
+                    f"Answer:"
+                )
+                ans_inputs = tokenizer(answer_prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
+                ans_out = model.generate(**ans_inputs, max_new_tokens=64)
+                ans_output = tokenizer.decode(ans_out[0], skip_special_tokens=True)
+                # Try to parse answer from output
+                a = None
+                for line in ans_output.split("\n"):
+                    l = line.strip()
+                    if l.lower().startswith("a:") or l.lower().startswith("answer:"):
+                        a = l.split(":", 1)[1].strip()
+                    elif l:  # fallback: take first non-empty line
+                        a = l
+                        break
+                print(f"Re-prompted answer: {a}")
+
+            print(f"Parsed Q: {q}")
+            print(f"Parsed A: {a}")
+            if not q or not a:
+                continue  # skip if parsing failed
+
+            qa = {
+                "qid": f"Q{i}",
+                "question": q,
+                "answer": a,
+                "answer_url": url,
+                "source_id": chunk_id,
+                "category": qtype
+            }
             qa_items.append(qa)
+
         with open(out_questions_path, "w", encoding="utf-8") as f:
             for qa in qa_items:
-                f.write(json.dumps(asdict(qa), ensure_ascii=False) + "\n")
+                f.write(json.dumps(qa, ensure_ascii=False) + "\n")
         print(f"Wrote {len(qa_items)} generated questions to {out_questions_path}")
 
 
@@ -757,7 +833,7 @@ else:
         p_eval.add_argument("--index_dense", default="data/index.faiss")
         p_eval.add_argument("--index_bm25", default="data/bm25_index")
         p_eval.add_argument("--questions", default="data/eval/questions.jsonl")
-        p_eval.add_argument("--out_prefix", default="results/report")
+        p_eval.add_argument("--out_prefix", default="results/report.csv")
         p_eval.add_argument("--embed_model", default="all-MiniLM-L6-v2")
         p_eval.add_argument("--gen_model", default="google/flan-t5-base")
         p_eval.add_argument("--device", default="cpu")
@@ -776,7 +852,7 @@ else:
         p_full.add_argument("--index_dense", default="data/index.faiss")
         p_full.add_argument("--index_bm25", default="data/bm25_index")
         p_full.add_argument("--out_questions", default="data/eval/questions.jsonl")
-        p_full.add_argument("--out_prefix", default="results/report")
+        p_full.add_argument("--out_prefix", default="results/report.csv")
         p_full.add_argument("--embed_model", default="all-MiniLM-L6-v2")
         p_full.add_argument("--gen_model", default="google/flan-t5-base")
         p_full.add_argument("--device", default="cpu")

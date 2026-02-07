@@ -3,7 +3,7 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 EMB_MODEL = "all-MiniLM-L6-v2"
-GEN_MODEL = "t5-small"  # choose a model appropriate to your resources
+GEN_MODEL = "google/flan-t5-base"  # choose a model appropriate to your resources
 
 def load_index(index_path="data/index.faiss"):
     index = faiss.read_index(index_path)
@@ -34,7 +34,7 @@ def generate_answer(query, docs):
 
 if __name__ == "__main__":
     index, ids, id2text = load_index()
-    q = "Marcos Luna Ruiz (born 5 April 2003) is a Spanish footballer who plays as a right-back for UD Almería?"
+    q = "What is the name of the party that announced that the winner of the leadership race will be made public on April 14, 2013, in Ottawa, Ontario? _"
     docs = retrieve(q, index, id2text, k=4)
     ans = generate_answer(q, docs)
-    print("Answer:\n", ans)
+    print(f"Question:\n {q}\n Answer:\n", ans)
