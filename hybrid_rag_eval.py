@@ -2,7 +2,7 @@
 hybrid_rag_eval.py
 
 Sample scaffold for:
-Assignment 2 – Hybrid RAG System with Automated Evaluation
+Assignment 2 - Hybrid RAG System with Automated Evaluation
 (with Streamlit UI stub wired to Retriever + Generator)
 
 This updated version integrates automated Wikipedia sampling helpers:
@@ -44,7 +44,7 @@ import matplotlib.pyplot as plt
 from sentence_transformers import SentenceTransformer
 import faiss
 from rank_bm25 import BM25Okapi
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModelForSeq2SeqLM
 
 # new dependency for Wikipedia helpers
 try:
@@ -229,6 +229,28 @@ def build_corpus_from_wikipedia(fixed_list: List[Dict[str, str]], random_list: L
     print(f"Wrote {len(chunks_out)} chunks to {output_path}")
     print(f"Wrote id2text mapping to {id2text_path}")
 
+def assemble_prompt(query: str, context_chunks: List[str], max_chunk_chars: int = 800) -> str:
+    # one-shot example + softened refusal, truncated per-chunk
+    parts = []
+    for i, c in enumerate(context_chunks, start=1):
+        text = (c.strip()[:max_chunk_chars].rsplit(" ", 1)[0] + "...") if len(c.strip()) > max_chunk_chars else c.strip()
+        parts.append(f"[{i}] {text}")
+    joined = "\n\n".join(parts) if parts else ""
+    few_shot = (
+        # "Example:\nContext:\n[1] Alice has a red bicycle.\n\nQuestion: What color is Alice's bicycle?\nAnswer: The bicycle is red. [1]\n\n"
+        ""
+    )
+    prompt = (
+        "You are a concise, helpful assistant. Use ONLY the provided Context to answer the Question. "
+        "If the answer is not present in the Context, reply: \"I don't know based on the provided context.\". "
+        "Answer in three sentences or less.\n\n"
+        # "Give only the answer, without any additional text or formatting.\n\n"
+        # "Cite context pieces by their number in square brackets at the end of the answer.\n\n"
+        + few_shot +
+        f"Context:\n{joined}\n\nQuestion: {query}\n\nAnswer:"
+    )
+    return prompt
+
 
 # ----------------------------
 # Dense Indexer (SentenceTransformer + FAISS)
@@ -361,15 +383,64 @@ class Generator:
         self.model_name = model_name
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+        cfg = AutoConfig.from_pretrained(model_name)
+        # choose seq2seq loader for encoder-decoder models, otherwise causal LM loader
+        if getattr(cfg, "is_encoder_decoder", False):
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+            self.is_seq2seq = True
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+            self.is_seq2seq = False
 
-    def generate(self, query: str, context_chunks: List[str], max_new_tokens: int = 128) -> str:
-        context = "\n\n".join(context_chunks)
-        prompt = f"Context:{context}  Question: {query} Answer:"
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
-        out = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
-        ans = self.tokenizer.decode(out[0], skip_special_tokens=True)
-        return ans.strip()
+    def generate(self, query: str, context_chunks: List[str], max_new_tokens: int = 128, max_chunk_chars: int = 800) -> str:
+        """
+        Assemble prompt, ensure it fits the model context window by shrinking per-chunk content
+        if needed, then generate. Moves inputs to self.device.
+        """
+        # compute allowed input tokens (leave margin for generation + special tokens)
+        model_max = getattr(self.tokenizer, "model_max_length", 1024)
+        safe_margin = 8
+        allowed_input_tokens = max(16, model_max - max_new_tokens - safe_margin)
+        # allowed_input_tokens = max(16, model_max - safe_margin)
+        print ("Allowed input tokens:", allowed_input_tokens)
+
+        # shrink per-chunk chars until tokenized prompt fits allowed_input_tokens
+        while True:
+            prompt = assemble_prompt(query, context_chunks, max_chunk_chars)
+            token_len = len(self.tokenizer(prompt, return_tensors="pt", truncation=False)["input_ids"][0])
+            if token_len <= allowed_input_tokens or max_chunk_chars <= 64:
+                print("prompt tokens:", token_len)
+                break
+            max_chunk_chars = int(max_chunk_chars * 0.75)
+
+        # print ("Final prompt: ", prompt)
+
+        # tokenise with truncation to model max just in case, then move tensors to device
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=model_max)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # less conservative generation to avoid very short outputs
+        gen_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.8,
+            top_p=0.9,
+            num_beams=3,
+            early_stopping=False,
+            eos_token_id=getattr(self.model.config, "eos_token_id", None)
+        )
+
+        out = self.model.generate(**inputs, **gen_kwargs)
+
+        if (self.is_seq2seq):
+            # for seq2seq, decode the generated output ids
+            ans = self.tokenizer.decode(out[0], skip_special_tokens=True)
+        else:
+            # for causal LM, decode the full input+output and then remove the prompt part
+            full_output = self.tokenizer.decode(out[0], skip_special_tokens=True)
+            ans = full_output[len(prompt):].strip()
+
+        return ans.strip(), prompt
 
 
 # ----------------------------
@@ -440,7 +511,7 @@ class Evaluator:
             retrieved = retriever.retrieve(qa.question, top_n=top_n)
             retrieved_urls = [r["url"] for r in retrieved]
             context_texts = [r["text"] for r in retrieved]
-            answer = generator.generate(qa.question, context_texts)
+            answer, _ = generator.generate(qa.question, context_texts)
             elapsed = time.time() - start
             mrr_val = self.compute_mrr_url(qa.answer_url, retrieved_urls)
             em_val = self.exact_match(answer, qa.answer)
@@ -685,7 +756,7 @@ def streamlit_app():
         return
 
     st.set_page_config(page_title="Hybrid RAG Demo", layout="wide")
-    st.title("Hybrid RAG — Demo UI (Streamlit Stub)")
+    st.title("Hybrid RAG - Assignment 2 - Group 121")
 
     # Sidebar: index / model configuration
     st.sidebar.header("Configuration")
@@ -698,6 +769,8 @@ def streamlit_app():
     k_dense = st.sidebar.number_input("k_dense (dense top-K)", min_value=1, max_value=500, value=100, step=1)
     k_sparse = st.sidebar.number_input("k_sparse (sparse top-K)", min_value=1, max_value=500, value=100, step=1)
     rrf_k = st.sidebar.number_input("RRF k", min_value=1, max_value=1000, value=60, step=1)
+    max_new_tokens = st.sidebar.number_input("Max new output tokens", min_value=1, max_value=2048, value=128, step=1)
+    max_chunk_chars = st.sidebar.number_input("Max chunk chars", min_value=1, max_value=3000, value=800, step=1)
     device = st.sidebar.selectbox("Device for generator", options=["cpu", "cuda"], index=0)
 
     if "loaded" not in st.session_state:
@@ -751,9 +824,16 @@ def streamlit_app():
             retrieved_urls = [r["url"] for r in retrieved]
             context_texts = [r["text"] for r in retrieved]
             gen_start = time.time()
-            answer = generator.generate(query, context_texts)
+            answer, final_prompt = generator.generate(query, context_texts, max_new_tokens=max_new_tokens, max_chunk_chars=max_chunk_chars)
             gen_time = time.time() - gen_start
             total_time = time.time() - start
+
+            # persist for subsequent reruns (buttons cause rerun)
+            st.session_state["last_retrieved"] = retrieved
+            st.session_state["last_contexts"] = context_texts
+            st.session_state["last_answer"] = answer
+            st.session_state["last_query"] = query
+            st.session_state["last_prompt"] = final_prompt
 
             st.markdown("### Generated Answer")
             st.info(answer)
@@ -780,10 +860,12 @@ def streamlit_app():
                     st.write(f"RRF score: {r['rrf_score']}, dense_rank: {r['dense_rank']}, sparse_rank: {r['sparse_rank']}")
                     st.write(r["text"])
 
-            if st.button("Show assembled prompt"):
-                joined_context = "\n\n".join(context_texts)
-                prompt = f"Context:\n\n{joined_context}\n\nQuestion: {query}\nAnswer:"
-                st.code(prompt)
+    if st.button("Show assembled prompt"):
+        ctxs = st.session_state.get("last_contexts")
+        if not ctxs:
+            st.warning("No context available. Run 'Retrieve & Generate' first.")
+        else:
+            st.code(st.session_state.get('last_prompt',''))
 
     st.markdown("---")
     st.write("Tip: Use the sidebar to point to local index files and models. Loading large models may take time.")
@@ -796,74 +878,79 @@ if __name__ != "__main__":
     pass
 else:
     # When executed as a script, check if streamlit is running it (streamlit sets certain env)
-    if "STREAMLIT_RUN" in os.environ or any("streamlit" in x for x in sys.argv):
+    print ("Checking whether to run Streamlit app or CLI...")
+    is_streamlit = "STREAMLIT_SERVER_HEADLESS" in os.environ or "streamlit.runtime" in sys.modules
+
+    if is_streamlit:
         # Call streamlit_app if streamlit run invoked the script
         try:
+            print ("Running Streamlit app...")
             streamlit_app()
         except Exception as e:
             print(f"Streamlit app failed to start: {e}")
 
-    # CLI entrypoint
-    def main():
-        parser = argparse.ArgumentParser(description="Hybrid RAG System + Automated Evaluation scaffold")
-        sub = parser.add_subparsers(dest="cmd")
-        # build_index
-        p_build = sub.add_parser("build_index")
-        p_build.add_argument("--fixed", default="fixed_urls.json", help="JSON file with 200 fixed pages (objects with url,title,text).")
-        p_build.add_argument("--generate_fixed", action="store_true", help="Generate fixed_urls.json by sampling Wikipedia (run once per group).")
-        p_build.add_argument("--fixed_n", type=int, default=200, help="Number of fixed pages to generate if --generate_fixed used.")
-        p_build.add_argument("--random_n", type=int, default=300, help="Number of random pages to sample for this run.")
-        p_build.add_argument("--min_words", type=int, default=200, help="Minimum words per Wikipedia page.")
-        p_build.add_argument("--chunks_out", default="data/processed/chunks.jsonl")
-        p_build.add_argument("--index_dense", default="data/index.faiss")
-        p_build.add_argument("--index_bm25", default="data/bm25_index")
-        p_build.add_argument("--embed_model", default="all-MiniLM-L6-v2")
-        p_build.set_defaults(func=cmd_build_index)
+    else:
+        # CLI entrypoint
+        def main():
+            parser = argparse.ArgumentParser(description="Hybrid RAG System + Automated Evaluation scaffold")
+            sub = parser.add_subparsers(dest="cmd")
+            # build_index
+            p_build = sub.add_parser("build_index")
+            p_build.add_argument("--fixed", default="fixed_urls.json", help="JSON file with 200 fixed pages (objects with url,title,text).")
+            p_build.add_argument("--generate_fixed", action="store_true", help="Generate fixed_urls.json by sampling Wikipedia (run once per group).")
+            p_build.add_argument("--fixed_n", type=int, default=200, help="Number of fixed pages to generate if --generate_fixed used.")
+            p_build.add_argument("--random_n", type=int, default=300, help="Number of random pages to sample for this run.")
+            p_build.add_argument("--min_words", type=int, default=200, help="Minimum words per Wikipedia page.")
+            p_build.add_argument("--chunks_out", default="data/processed/chunks.jsonl")
+            p_build.add_argument("--index_dense", default="data/index.faiss")
+            p_build.add_argument("--index_bm25", default="data/bm25_index")
+            p_build.add_argument("--embed_model", default="all-MiniLM-L6-v2")
+            p_build.set_defaults(func=cmd_build_index)
 
-        # generate_questions
-        p_gq = sub.add_parser("generate_questions")
-        p_gq.add_argument("--chunks_in", default="data/processed/chunks.jsonl")
-        p_gq.add_argument("--out_questions", default="data/eval/questions.jsonl")
-        p_gq.add_argument("--num_questions", type=int, default=100)
-        p_gq.set_defaults(func=cmd_generate_questions)
+            # generate_questions
+            p_gq = sub.add_parser("generate_questions")
+            p_gq.add_argument("--chunks_in", default="data/processed/chunks.jsonl")
+            p_gq.add_argument("--out_questions", default="data/eval/questions.jsonl")
+            p_gq.add_argument("--num_questions", type=int, default=100)
+            p_gq.set_defaults(func=cmd_generate_questions)
 
-        # run_eval
-        p_eval = sub.add_parser("run_eval")
-        p_eval.add_argument("--chunks_in", default="data/processed/chunks.jsonl")
-        p_eval.add_argument("--index_dense", default="data/index.faiss")
-        p_eval.add_argument("--index_bm25", default="data/bm25_index")
-        p_eval.add_argument("--questions", default="data/eval/questions.jsonl")
-        p_eval.add_argument("--out_prefix", default="results/report.csv")
-        p_eval.add_argument("--embed_model", default="all-MiniLM-L6-v2")
-        p_eval.add_argument("--gen_model", default="google/flan-t5-base")
-        p_eval.add_argument("--device", default="cpu")
-        p_eval.add_argument("--top_n", type=int, default=10)
-        p_eval.add_argument("--recall_k", type=int, default=10)
-        p_eval.set_defaults(func=cmd_run_eval)
+            # run_eval
+            p_eval = sub.add_parser("run_eval")
+            p_eval.add_argument("--chunks_in", default="data/processed/chunks.jsonl")
+            p_eval.add_argument("--index_dense", default="data/index.faiss")
+            p_eval.add_argument("--index_bm25", default="data/bm25_index")
+            p_eval.add_argument("--questions", default="data/eval/questions.jsonl")
+            p_eval.add_argument("--out_prefix", default="results/report")
+            p_eval.add_argument("--embed_model", default="all-MiniLM-L6-v2")
+            p_eval.add_argument("--gen_model", default="google/flan-t5-base")
+            p_eval.add_argument("--device", default="cpu")
+            p_eval.add_argument("--top_n", type=int, default=3)
+            p_eval.add_argument("--recall_k", type=int, default=10)
+            p_eval.set_defaults(func=cmd_run_eval)
 
-        # full pipeline
-        p_full = sub.add_parser("full_pipeline")
-        p_full.add_argument("--fixed", default="fixed_urls.json")
-        p_full.add_argument("--generate_fixed", action="store_true")
-        p_full.add_argument("--fixed_n", type=int, default=200)
-        p_full.add_argument("--random_n", type=int, default=300)
-        p_full.add_argument("--min_words", type=int, default=200)
-        p_full.add_argument("--chunks_out", default="data/processed/chunks.jsonl")
-        p_full.add_argument("--index_dense", default="data/index.faiss")
-        p_full.add_argument("--index_bm25", default="data/bm25_index")
-        p_full.add_argument("--out_questions", default="data/eval/questions.jsonl")
-        p_full.add_argument("--out_prefix", default="results/report.csv")
-        p_full.add_argument("--embed_model", default="all-MiniLM-L6-v2")
-        p_full.add_argument("--gen_model", default="google/flan-t5-base")
-        p_full.add_argument("--device", default="cpu")
-        p_full.add_argument("--top_n", type=int, default=10)
-        p_full.add_argument("--recall_k", type=int, default=10)
-        p_full.set_defaults(func=cmd_full_pipeline)
+            # full pipeline
+            p_full = sub.add_parser("full_pipeline")
+            p_full.add_argument("--fixed", default="fixed_urls.json")
+            p_full.add_argument("--generate_fixed", action="store_true")
+            p_full.add_argument("--fixed_n", type=int, default=200)
+            p_full.add_argument("--random_n", type=int, default=300)
+            p_full.add_argument("--min_words", type=int, default=200)
+            p_full.add_argument("--chunks_out", default="data/processed/chunks.jsonl")
+            p_full.add_argument("--index_dense", default="data/index.faiss")
+            p_full.add_argument("--index_bm25", default="data/bm25_index")
+            p_full.add_argument("--out_questions", default="data/eval/questions.jsonl")
+            p_full.add_argument("--out_prefix", default="results/report")
+            p_full.add_argument("--embed_model", default="all-MiniLM-L6-v2")
+            p_full.add_argument("--gen_model", default="google/flan-t5-base")
+            p_full.add_argument("--device", default="cpu")
+            p_full.add_argument("--top_n", type=int, default=3)
+            p_full.add_argument("--recall_k", type=int, default=10)
+            p_full.set_defaults(func=cmd_full_pipeline)
 
-        args = parser.parse_args()
-        if not hasattr(args, "func"):
-            parser.print_help()
-            return
-        args.func(args)
+            args = parser.parse_args()
+            if not hasattr(args, "func"):
+                parser.print_help()
+                return
+            args.func(args)
 
-    main()
+        main()
