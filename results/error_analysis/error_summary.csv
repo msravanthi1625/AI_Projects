@@ -1,0 +1,5 @@
+Question_Type,Total,Success,Success_Rate,Retrieval_Issues,Generation_Issues
+comparative,25,9,36.0%,0,16
+factual,25,2,8.0%,3,20
+inferential,25,8,32.0%,1,16
+multi-hop,25,13,52.0%,0,12

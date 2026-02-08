@@ -29,6 +29,7 @@ import time
 import sys
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import wikipedia
@@ -141,26 +142,115 @@ def generate_fixed_set(n: int = 2, min_words: int = 200, out_path: str = "fixed_
     return urls
 
 
-def generate_random_set(n: int = 10, min_words: int = 200, exclude_titles: Optional[List[str]] = None) -> List[Dict[str, str]]:
-    """
-    Generate n unique random Wikipedia pages, excluding any titles in exclude_titles.
-    Returns a list of dicts {url, title, text}. Does NOT write to disk by default.
-    """
-    if wikipedia is None:
-        raise ImportError("The 'wikipedia' package is required for generate_random_set. Install with `pip install wikipedia`.")
-    urls = []
-    titles = set(exclude_titles) if exclude_titles else set()
-    print(f"Generating random set of {n} pages (min {min_words} words), excluding {len(titles)} titles...")
-    while len(urls) < n:
-        page = get_random_wikipedia_url(min_words)
-        if page["title"] not in titles:
-            urls.append({"url": page["url"], "title": page["title"], "text": page["text"]})
-            titles.add(page["title"])
-            if len(urls) % 50 == 0:
-                print(f"  collected {len(urls)}/{n}")
-    print(f"Generated random set of {n} pages.")
-    return urls
+# def generate_random_set(n: int = 10, min_words: int = 200, exclude_titles: Optional[List[str]] = None, max_workers: int = 4) -> List[Dict[str, str]]:
+#     """
+#     Generate n unique random Wikipedia pages, excluding any titles in exclude_titles.
+#     Returns a list of dicts {url, title, text}. Does NOT write to disk by default.
+#     """
+#     if wikipedia is None:
+#         raise ImportError("The 'wikipedia' package is required for generate_random_set. Install with `pip install wikipedia`.")
+#     urls = []
+#     titles = set(exclude_titles) if exclude_titles else set()
+#     print(f"Generating random set of {n} pages (min {min_words} words), excluding {len(titles)} titles...")
 
+#     while len(urls) < n:
+#         page = get_random_wikipedia_url(min_words)
+#         if page["title"] not in titles:
+#             urls.append({"url": page["url"], "title": page["title"], "text": page["text"]})
+#             titles.add(page["title"])
+#             if len(urls) % 10 == 0:
+#                 print(f"  collected {len(urls)}/{n}")
+    
+#     print(f"Generated random set of {len(urls)} pages.")
+#     return urls
+
+def generate_random_set(n: int = 10, min_words: int = 200, exclude_titles: Optional[List[str]] = None,
+                        batch: int = 50, sleep: float = 0.6, max_retries: int = 3) -> List[Dict[str, str]]:
+    """
+    Fetch n unique random Wikipedia pages using the MediaWiki API in batches.
+    Respects Retry-After and pauses between requests to avoid rate limits.
+    Returns list of dicts {url, title, text}.
+    """
+    print(f"Generating random set of {n} pages (min {min_words} words)...")
+
+    API = "https://en.wikipedia.org/w/api.php"
+    session = requests.Session()
+    # Provide a polite User-Agent with contact per Wikimedia policy
+    session.headers.update({"User-Agent": "hybrid-rag-demo/1.0 (mailto:romanmaniac@gmail.com)"})
+
+    def _norm_title(t: str) -> str:
+        return (t or "").strip().lower()
+
+    excludes = set(_norm_title(t) for t in (exclude_titles or []))
+    collected: List[Dict[str, str]] = []
+    seen_titles = set(excludes)
+
+    # increase exchars so extracts are large enough
+    exchars = str(100000)
+
+    while len(collected) < n:
+        print (f"Collected {len(collected)}/{n} pages so far...")
+        take = min(batch, n - len(collected))
+        params = {
+            "action": "query",
+            "format": "json",
+            "generator": "random",
+            "grnnamespace": "0",
+            "grnlimit": str(take),
+            "prop": "extracts|info",
+            "explaintext": "1",
+            "exchars": exchars,
+            "inprop": "url"
+        }
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                r = session.get(API, params=params, timeout=30)
+            except Exception:
+                # transient network error -> backoff and retry
+                time.sleep(min(5.0, 0.5 * attempt))
+                continue
+
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                except Exception:
+                    time.sleep(0.5 * attempt)
+                    continue
+
+                pages = j.get("query", {}).get("pages", {})
+                for p in pages.values():
+                    title = p.get("title", "")
+                    text = p.get("extract", "") or ""
+                    if len(text.split()) < min_words:
+                        continue
+                    tnorm = _norm_title(title)
+                    if tnorm in seen_titles:
+                        continue
+                    collected.append({"url": p.get("fullurl", ""), "title": title, "text": text})
+                    seen_titles.add(tnorm)
+                    if len(collected) >= n:
+                        break
+                break  # successful batch processed
+
+            elif r.status_code == 429:
+                # honor Retry-After if provided
+                ra = r.headers.get("Retry-After")
+                wait = float(ra) if ra and ra.isdigit() else 5.0
+                time.sleep(wait)
+            else:
+                # other server error -> small backoff and retry
+                time.sleep(min(5.0, 0.5 * attempt))
+
+        # polite pause between batches
+        time.sleep(sleep)
+
+        # safety: if API returning nothing repeatedly, avoid infinite loop
+        if len(collected) == 0 and attempt == max_retries:
+            raise RuntimeError("Failed to fetch pages from Wikipedia API after retries.")
+
+    print(f"Generated random set of {len(collected[:n])} pages (requested {n}).")
+    return collected[:n]
 
 # ----------------------------
 # Chunking utility
@@ -500,7 +590,7 @@ class Evaluator:
         return int(ground_truth_url in retrieved_urls[:k])
 
     def evaluate_all(self, qa_items: List[QAItem], retriever: Retriever, generator: Generator,
-                     top_n: int = 10, recall_k: int = 10) -> Tuple[pd.DataFrame, Dict[str, float]]:
+                     k_dense: int = 100, k_sparse: int = 100, rrf_k: int = 60, top_n: int = 10, recall_k: int = 10) -> Tuple[pd.DataFrame, Dict[str, float]]:
         rows = []
         mrrs = []
         ems = []
@@ -508,7 +598,7 @@ class Evaluator:
         times = []
         for qa in qa_items:
             start = time.time()
-            retrieved = retriever.retrieve(qa.question, top_n=top_n)
+            retrieved = retriever.retrieve(qa.question, k_dense=k_dense, k_sparse=k_sparse, rrf_k=rrf_k, top_n=top_n)
             retrieved_urls = [r["url"] for r in retrieved]
             context_texts = [r["text"] for r in retrieved]
             answer, _ = generator.generate(qa.question, context_texts)
@@ -572,12 +662,13 @@ class QuestionGenerator:
             ("multi-hop", "Generate a multi-hop question and its answer from the following context (require combining information from multiple sentences). Output both the question and the answer, each on a new line, prefixed with 'Question:' and 'Answer:'."),
         ]
 
-        for i in range(num_questions):
+        qa_index = 0
+        while len(qa_items) < num_questions:
             c = random.choice(chunks)
             context = c["text"]
             chunk_id = c.get("id", None)
             url = c.get("url", None)
-            qtype, qtype_prompt = qtypes[i % len(qtypes)]
+            qtype, qtype_prompt = qtypes[qa_index % len(qtypes)]
             prompt = (
                 f"{qtype_prompt}\n"
                 f"Context:\n{context}\n"
@@ -626,7 +717,7 @@ class QuestionGenerator:
                 continue  # skip if parsing failed
 
             qa = {
-                "qid": f"Q{i}",
+                "qid": f"Q{qa_index}",
                 "question": q,
                 "answer": a,
                 "answer_url": url,
@@ -634,6 +725,7 @@ class QuestionGenerator:
                 "category": qtype
             }
             qa_items.append(qa)
+            qa_index += 1
 
         with open(out_questions_path, "w", encoding="utf-8") as f:
             for qa in qa_items:
