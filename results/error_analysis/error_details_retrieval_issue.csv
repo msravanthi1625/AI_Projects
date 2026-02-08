@@ -1,0 +1,5 @@
+QID,Question_Type,Question,Gold_Answer,Predicted_Answer,MRR,Recall@K,Response_Time
+Q36,factual,How many years did it take for the Gemini astronauts to return to Earth? Answer: 225 miles (362 km) ,2,1,0.0,0,0.26s
+Q38,inferential,What is the name of the person who wrote the article?/question> Answer: /question>,John McKinney,Zeigarnik,0.0,0,0.31s
+Q64,factual,What is the name of the town where the film takes place?,Randville,Milan,0.0,0,0.36s
+Q68,factual,What was the name of the book that Thalab edited? Answer: Kitb al-Fa.,Die Grammat (transl. from MS in the British Museum),I don't know based on the given context.,0.0,0,0.63s
